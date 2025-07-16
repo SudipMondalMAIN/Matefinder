@@ -67,37 +67,38 @@ def get_partner(user_id: int) -> int | None:
     return active_chats.get(user_id)
 
 
-def end_chat(user_id: int, app) -> None:
+async def end_chat(user_id: int, app) -> None:
     """Disconnect user (and partner if exists)."""
     partner_id = active_chats.pop(user_id, None)
     if partner_id:
         active_chats.pop(partner_id, None)
-        asyncio.create_task(
-            app.bot.send_message(
-                partner_id,
-                "🔇 The chat has ended. Type /find to meet someone new.",
-            )
+        await app.bot.send_message(
+            partner_id,
+            "🔇 The chat has ended. Type /find to meet someone new.",
         )
 
 
-def match_users(app):
+async def match_users(app):
     """Attempt to match users in queue based on preferences."""
     if len(waiting_queue) < 2:
         return
 
     queue_list = list(waiting_queue)
     for i, uid1 in enumerate(queue_list):
-        prof1: Profile = app.chat_data.get(uid1, {}).get(USER_DATA_KEY)
+        # Use user_data for per-user data
+        user_data_dict = app.user_data.get(uid1, {})
+        prof1: Profile = user_data_dict.get(USER_DATA_KEY)
+        if not prof1:
+            continue
         for uid2 in queue_list[i + 1 :]:
             if uid2 not in waiting_queue:
                 continue
-            prof2: Profile = app.chat_data.get(uid2, {}).get(USER_DATA_KEY)
-            ok1 = (prof1.preference == "any") or (
-                prof2 and prof2.gender == prof1.preference
-            )
-            ok2 = (prof2.preference == "any") or (
-                prof1 and prof1.gender == prof2.preference
-            )
+            user_data_dict2 = app.user_data.get(uid2, {})
+            prof2: Profile = user_data_dict2.get(USER_DATA_KEY)
+            if not prof2:
+                continue
+            ok1 = (prof1.preference == "any") or (prof2 and prof2.gender == prof1.preference)
+            ok2 = (prof2.preference == "any") or (prof1 and prof1.gender == prof2.preference)
             if ok1 and ok2:
                 # Match!
                 waiting_queue.discard(uid1)
@@ -105,19 +106,15 @@ def match_users(app):
                 active_chats[uid1] = uid2
                 active_chats[uid2] = uid1
                 log.info("Matched %s <-> %s", uid1, uid2)
-                asyncio.create_task(
-                    app.bot.send_message(
-                        uid1,
-                        "💖 You're now connected! Say hi.\n"
-                        "Commands: /skip  /stop  /report",
-                    )
+                await app.bot.send_message(
+                    uid1,
+                    "💖 You're now connected! Say hi.\n"
+                    "Commands: /skip  /stop  /report",
                 )
-                asyncio.create_task(
-                    app.bot.send_message(
-                        uid2,
-                        "💖 You're now connected! Say hi.\n"
-                        "Commands: /skip  /stop  /report",
-                    )
+                await app.bot.send_message(
+                    uid2,
+                    "💖 You're now connected! Say hi.\n"
+                    "Commands: /skip  /stop  /report",
                 )
                 break  # break inner loop
 
@@ -188,13 +185,13 @@ async def find(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     waiting_queue.add(user_id)
     await update.message.reply_text("🔍 Searching for a match…")
-    match_users(context.application)
+    await match_users(context.application)
 
 
 async def stop_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in active_chats:
-        end_chat(user_id, context.application)
+        await end_chat(user_id, context.application)
         await update.message.reply_text("👋 You left the chat. Use /find to match again.")
     elif user_id in waiting_queue:
         waiting_queue.discard(user_id)
@@ -208,10 +205,10 @@ async def skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in active_chats:
         await update.message.reply_text("❌ You're not in a chat to skip.")
         return
-    end_chat(user_id, context.application)
+    await end_chat(user_id, context.application)
     waiting_queue.add(user_id)
     await update.message.reply_text("⏭️ Looking for someone new…")
-    match_users(context.application)
+    await match_users(context.application)
 
 
 async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -222,7 +219,7 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     reports[partner_id] += 1
     await update.message.reply_text("🚩 Partner reported. Thank you.")
-    end_chat(user_id, context.application)
+    await end_chat(user_id, context.application)
 
 
 async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -234,7 +231,7 @@ async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     if update.message.sticker:
-        await context.bot.forward_sticker(partner_id, update.message)
+        await context.bot.send_sticker(partner_id, update.message.sticker.file_id)
     else:
         await context.bot.send_message(partner_id, update.message.text_html, parse_mode=constants.ParseMode.HTML)
 
