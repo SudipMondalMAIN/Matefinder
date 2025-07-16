@@ -11,7 +11,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # === CONFIG ===
-BOT_TOKEN = os.environ.get("7620053279:AAFfGVyoXsL5nOL0U5DcmDG4QDsW3XYb6t4")  # Set your token in environment variable for safety!
+BOT_TOKEN = os.environ.get("7620053279:AAGV0usPRt-8Q_TyQMhmZme0Y1h-XBoovCw")  # Use environment variable for safety!
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("Matefinder")
@@ -22,8 +22,7 @@ CREATE_SQL = [
         user_id INTEGER PRIMARY KEY,
         name TEXT,
         age INTEGER,
-        gender TEXT,
-        pref TEXT
+        gender TEXT
     )""",
     """CREATE TABLE IF NOT EXISTS queue (
         user_id INTEGER UNIQUE,
@@ -48,7 +47,6 @@ class Onboard(StatesGroup):
     name = State()
     age = State()
     gender = State()
-    pref = State()
 
 class Chatting(StatesGroup):
     in_chat = State()
@@ -74,9 +72,9 @@ class DB:
         )
         await self.db.commit()
     async def get_profile(self, uid):
-        cur = await self.db.execute("SELECT name,age,gender,pref FROM users WHERE user_id=?", (uid,))
+        cur = await self.db.execute("SELECT name,age,gender FROM users WHERE user_id=?", (uid,))
         r = await cur.fetchone()
-        return dict(zip(["name", "age", "gender", "pref"], r)) if r else None
+        return dict(zip(["name", "age", "gender"], r)) if r else None
     async def enqueue(self, uid):
         await self.db.execute("INSERT OR IGNORE INTO queue(user_id,queued_at) VALUES(?,?)", (uid, datetime.utcnow()))
         await self.db.commit()
@@ -89,7 +87,8 @@ class DB:
         candidates = await cur.fetchall()
         for (cand,) in candidates:
             cprof = await self.get_profile(cand)
-            if prof and cprof and prof["pref"] in ("any", cprof["gender"]) and cprof["pref"] in ("any", prof["gender"]):
+            # Match logic: just connect any two users, or you can add gender logic here
+            if prof and cprof:
                 await self.db.execute("DELETE FROM queue WHERE user_id IN (?,?)", (uid, cand))
                 t = datetime.utcnow()
                 await self.db.execute("INSERT OR REPLACE INTO chats(user_id,partner_id,since) VALUES(?,?,?)", (uid, cand, t))
@@ -121,13 +120,6 @@ def gender_kb():
     for g in ("male", "female", "other"):
         kb.button(text=g.capitalize(), callback_data=f"g:{g}")
     kb.adjust(3)
-    return kb.as_markup()
-
-def pref_kb():
-    kb = InlineKeyboardBuilder()
-    for p in ("male", "female", "other", "any"):
-        kb.button(text=p.capitalize(), callback_data=f"g:{p}")
-    kb.adjust(4)
     return kb.as_markup()
 
 # === Bot logic ===
@@ -165,16 +157,8 @@ async def age(m: types.Message, state: FSMContext):
 @dp.callback_query(F.data.startswith("g:"))
 async def got_gender(cb: types.CallbackQuery, state: FSMContext):
     g = cb.data.split(":")[1]
-    await state.update_data(gender=g)
-    await cb.message.edit_text("Preferred partner gender?", reply_markup=pref_kb())
-    await state.set_state(Onboard.pref)
-    await cb.answer()
-
-@dp.callback_query(F.data.startswith("g:"))
-async def got_pref(cb: types.CallbackQuery, state: FSMContext):
-    p = cb.data.split(":")[1]
     data = await state.get_data()
-    await db.update(cb.from_user.id, name=data["name"], age=data["age"], gender=data["gender"], pref=p)
+    await db.update(cb.from_user.id, name=data["name"], age=data["age"], gender=g)
     await state.clear()
     await cb.message.edit_text("✅ Profile saved! Use /find to meet someone.")
     await cb.answer()
@@ -184,7 +168,7 @@ async def profile(m: types.Message):
     p = await db.get_profile(m.from_user.id)
     if not p or not p["name"]:
         return await m.reply("No profile. Send /start")
-    await m.answer(f"Name: {p['name']}\nAge: {p['age']}\nGender: {p['gender']}\nPrefers: {p['pref']}")
+    await m.answer(f"Name: {p['name']}\nAge: {p['age']}\nGender: {p['gender']}")
 
 @dp.message(Command("find"))
 async def find(m: types.Message):
