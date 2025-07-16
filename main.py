@@ -1,457 +1,416 @@
+#!/usr/bin/env python3
 """
-MateFinder Telegram Dating Bot
-Author : 𝐒𝐮𝐝𝐢𝐩 𝐌𝐨𝐧𝐝𝐚𝐥 (July 2025)
-Python : 3.11+
-Libs   : python-telegram-bot v21 (async)
-Run    : python main.py
+MateFinder — Telegram anonymous dating bot
+Features:
+    /start    – guided profile onboarding
+    /find     – enter matchmaking queue  (alias /next)
+/next      – leave current chat & match again
+    /stop     – quit current chat
+    /profile  – view / edit profile
+    /settings – set gender preference
+    /report   – report partner while chatting
+    /help     – command list
+Fully async, no external services: uses SQLite via aiosqlite.
 """
 
 import asyncio
 import logging
 import os
-from collections import defaultdict
-from dataclasses import dataclass
-from enum import Enum, auto
+from datetime import datetime
+from enum import StrEnum, auto
+from typing import Optional
 
+import aiosqlite
+from aiogram import Bot, Dispatcher, F, Router, types
+from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Update,
-    constants,
-)
-from telegram.ext import (
-    ApplicationBuilder,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    ConversationHandler,
-    MessageHandler,
-    filters,
-)
 
-# ---------- Config & Globals ----------
+###############################################################################
+#                         0.  BASIC CONFIG & LOGGING                          #
+###############################################################################
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("7620053279:AAFfGVyoXsL5nOL0U5DcmDG4QDsW3XYb6t4")
+BOT_TOKEN = os.getenv("7620053279:AAFfGVyoXsL5nOL0U5DcmDG4QDsW3XYb6t4")           # put your token in .env
+ADMIN_IDS = {int(x) for x in os.getenv("ADMINS", "").split(",") if x}  # optional
 
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-log = logging.getLogger("MateFinderBot")
+log = logging.getLogger("MateFinder")
 
-# Admins list (provide your Telegram user ids here)
-ADMINS = {7620053279}  # Replace with actual admin user IDs
+###############################################################################
+#                                 1.  DB LAYER                                #
+###############################################################################
+DB_FILE = "matefinder.db"
 
-# Conversation states
-class RegState(Enum):
-    GENDER = auto()
-    PREF = auto()
-    DONE = auto()
-    EDIT_GENDER = auto()
-    EDIT_PREF = auto()
+CREATE_SQL = [
+    """CREATE TABLE IF NOT EXISTS users(
+            user_id     INTEGER PRIMARY KEY,
+            name        TEXT,
+            gender      TEXT,
+            age         INTEGER,
+            bio         TEXT,
+            photo_id    TEXT,
+            pref        TEXT DEFAULT 'any'
+        )""",
+    """CREATE TABLE IF NOT EXISTS queue(
+            user_id     INTEGER UNIQUE,
+            queued_at   TIMESTAMP,
+            FOREIGN KEY(user_id) REFERENCES users(user_id)
+        )""",
+    """CREATE TABLE IF NOT EXISTS chats(
+            user_id     INTEGER UNIQUE,
+            partner_id  INTEGER,
+            since       TIMESTAMP,
+            FOREIGN KEY(user_id)    REFERENCES users(user_id),
+            FOREIGN KEY(partner_id) REFERENCES users(user_id)
+        )""",
+    """CREATE TABLE IF NOT EXISTS reports(
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            reporter    INTEGER,
+            reported    INTEGER,
+            reason      TEXT,
+            ts          TIMESTAMP
+        )""",
+]
 
-# In-memory data (replace with DB for production)
-waiting_queue: set[int] = set()
-active_chats: dict[int, int] = {}       # user_id -> partner_id
-reports: defaultdict[int, int] = defaultdict(int)  # partner_id -> count
-USER_DATA_KEY = "profile"
+class Gender(StrEnum):
+    male = "male"
+    female = "female"
+    other = "other"
+    any = "any"
 
-# ---------- Data Classes ----------
-@dataclass
-class Profile:
-    gender: str
-    preference: str   # "male" | "female" | "any"
+class DB:
+    """Lightweight async DB helper"""
+    def __init__(self, db_file: str):
+        self.file = db_file
+        self._pool: Optional[aiosqlite.Connection] = None
 
-# ---------- Helper Functions ----------
-def get_partner(user_id: int) -> int | None:
-    return active_chats.get(user_id)
+    async def init(self):
+        self._pool = await aiosqlite.connect(self.file)
+        await self._pool.execute("PRAGMA foreign_keys=ON")
+        for stmt in CREATE_SQL:
+            await self._pool.execute(stmt)
+        await self._pool.commit()
+        log.info("DB ready")
 
-def get_user_profile(app, user_id: int) -> Profile | None:
-    user_data_dict = app.user_data.get(user_id, {})
-    return user_data_dict.get(USER_DATA_KEY)
+    async def add_user_if_not_exists(self, user_id: int):
+        async with self._pool.execute(
+            "SELECT 1 FROM users WHERE user_id=?", (user_id,)
+        ) as cur:
+            if await cur.fetchone() is None:
+                await self._pool.execute("INSERT INTO users(user_id) VALUES(?)", (user_id,))
+                await self._pool.commit()
 
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMINS
-
-async def end_chat(user_id: int, app) -> None:
-    """Disconnect user (and partner if exists)."""
-    partner_id = active_chats.pop(user_id, None)
-    if partner_id:
-        active_chats.pop(partner_id, None)
-        await app.bot.send_message(
-            partner_id,
-            "🔇 The chat has ended. Type /find to meet someone new.",
+    async def update_profile(self, user_id: int, **fields):
+        keys, vals = zip(*fields.items())
+        sets = ",".join(f"{k}=?" for k in keys)
+        await self._pool.execute(
+            f"UPDATE users SET {sets} WHERE user_id=?", (*vals, user_id)
         )
+        await self._pool.commit()
 
-async def match_users(app):
-    """Attempt to match users in queue based on preferences. Debug version."""
-    log.info(f"[MATCH] Waiting queue: {waiting_queue}")
-    if len(waiting_queue) < 2:
-        log.info("[MATCH] Not enough users in queue.")
-        return
+    async def get_profile(self, user_id: int):
+        async with self._pool.execute(
+            "SELECT name,gender,age,bio,photo_id,pref FROM users WHERE user_id=?", (user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            if not row:
+                return None
+            return dict(zip(("name","gender","age","bio","photo","pref"), row))
 
-    queue_list = list(waiting_queue)
-    for i, uid1 in enumerate(queue_list):
-        user_data_dict = app.user_data.get(uid1, {})
-        prof1: Profile = user_data_dict.get(USER_DATA_KEY)
-        log.info(f"[MATCH] UID1: {uid1} Profile: {prof1}")
-        if not prof1:
-            continue
-        for uid2 in queue_list[i + 1:]:
-            if uid2 not in waiting_queue:
-                continue
-            user_data_dict2 = app.user_data.get(uid2, {})
-            prof2: Profile = user_data_dict2.get(USER_DATA_KEY)
-            log.info(f"[MATCH]   UID2: {uid2} Profile: {prof2}")
-            if not prof2:
-                continue
-            ok1 = (prof1.preference == "any") or (prof2 and prof2.gender == prof1.preference)
-            ok2 = (prof2.preference == "any") or (prof1 and prof1.gender == prof2.preference)
-            log.info(f"[MATCH]   ok1={ok1}, ok2={ok2}")
-            if ok1 and ok2:
-                # Match!
-                waiting_queue.discard(uid1)
-                waiting_queue.discard(uid2)
-                active_chats[uid1] = uid2
-                active_chats[uid2] = uid1
-                log.info(f"[MATCH] Matched {uid1} <-> {uid2}")
-                await app.bot.send_message(
-                    uid1,
-                    "💖 You're now connected! Say hi.\n"
-                    "Commands: /skip  /stop  /report  /cancel",
-                )
-                await app.bot.send_message(
-                    uid2,
-                    "💖 You're now connected! Say hi.\n"
-                    "Commands: /skip  /stop  /report  /cancel",
-                )
-                return  # Only match one pair at a time
-    log.info("[MATCH] No match found in this round.")
-
-# ---------- Command Handlers ----------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Only allow profile creation once per user
-    if context.user_data.get(USER_DATA_KEY):
-        await update.message.reply_text(
-            "✅ You already have a profile.\nUse /profile to view it or /find to chat."
+    # ---------- matchmaking ----------
+    async def enqueue(self, user_id: int):
+        await self._pool.execute(
+            "INSERT OR IGNORE INTO queue(user_id,queued_at) VALUES(?,?)",
+            (user_id, datetime.utcnow()),
         )
-        return ConversationHandler.END
+        await self._pool.commit()
 
-    await update.message.reply_text(
-        "👋 Welcome to MateFinder!\n"
-        "Let's set up your profile (only once).\n"
-        "Select your gender:",
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("♂️ Male", callback_data="g_male"),
-                    InlineKeyboardButton("♀️ Female", callback_data="g_female"),
-                ],
-                [InlineKeyboardButton("⚧️ Other", callback_data="g_other")],
-            ]
-        ),
-    )
-    return RegState.GENDER
+    async def dequeue(self, user_id: int):
+        await self._pool.execute("DELETE FROM queue WHERE user_id=?", (user_id,))
+        await self._pool.commit()
 
-async def gender_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    gender = query.data.split("_")[1]
-    context.user_data[USER_DATA_KEY] = Profile(gender=gender, preference="")
-    await query.edit_message_text(
-        "Who would you like to meet?",
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("♂️ Male", callback_data="p_male"),
-                    InlineKeyboardButton("♀️ Female", callback_data="p_female"),
-                ],
-                [InlineKeyboardButton("🤝 Anyone", callback_data="p_any")],
-            ]
-        ),
-    )
-    return RegState.PREF
+    async def pop_match(self, user_id: int):
+        """Find a partner respecting gender preference."""
+        async with self._pool.execute(
+            "SELECT pref FROM users WHERE user_id=?", (user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return None
+        my_pref = row[0] or Gender.any
+        # iterate queue for first compatible partner
+        async with self._pool.execute("SELECT user_id FROM queue WHERE user_id!=?", (user_id,)) as cur:
+            async for (candidate,) in cur:
+                # check candidate's pref reciprocity
+                async with self._pool.execute(
+                    "SELECT gender,pref FROM users WHERE user_id=?", (candidate,)
+                ) as c2:
+                    gender2, pref2 = await c2.fetchone()
+                async with self._pool.execute(
+                    "SELECT gender FROM users WHERE user_id=?", (user_id,)
+                ) as c3:
+                    gender1 = (await c3.fetchone())[0]
+                if (my_pref in (Gender.any, gender2)) and (pref2 in (Gender.any, gender1)):
+                    # compatible
+                    await self._pool.execute("DELETE FROM queue WHERE user_id IN (?,?)", (user_id,candidate))
+                    await self._pool.execute(
+                        "INSERT OR REPLACE INTO chats(user_id,partner_id,since) VALUES(?,?,?)",
+                        (user_id, candidate, datetime.utcnow()),
+                    )
+                    await self._pool.execute(
+                        "INSERT OR REPLACE INTO chats(user_id,partner_id,since) VALUES(?,?,?)",
+                        (candidate, user_id, datetime.utcnow()),
+                    )
+                    await self._pool.commit()
+                    return candidate
+        return None
 
-async def pref_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    pref = query.data.split("_")[1]
-    profile: Profile = context.user_data[USER_DATA_KEY]
-    profile.preference = "any" if pref == "any" else pref
-    await query.edit_message_text(
-        "✅ Profile saved!\n\nCommands:\n"
-        "• /find – browse potential matches\n"
-        "• /edit – edit your profile\n"
-        "• /profile – view your profile\n"
-        "• /stop – end current chat\n"
-        "• /skip – next partner\n"
-        "• /report – report current partner\n"
-        "• /help – show all commands\n"
-        "• /cancel – cancel current operation"
-    )
-    return ConversationHandler.END
+    # ---------- chat helpers ----------
+    async def get_partner(self, user_id: int):
+        async with self._pool.execute(
+            "SELECT partner_id FROM chats WHERE user_id=?", (user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else None
 
-async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    prof = context.user_data.get(USER_DATA_KEY)
-    if not prof:
-        await update.message.reply_text("❌ You don't have a profile yet. Use /start to create one.")
-        return
-    await update.message.reply_text(
-        f"📝 Your Profile:\n"
-        f"• Gender: {prof.gender.capitalize()}\n"
-        f"• Preference: {prof.preference.capitalize() if prof.preference != 'any' else 'Anyone'}\n\n"
-        "Use /edit to update your profile."
-    )
+    async def end_chat(self, user_id: int, notify_partner=True):
+        partner = await self.get_partner(user_id)
+        await self._pool.execute("DELETE FROM chats WHERE user_id IN (?,?)", (user_id, partner or -1))
+        await self._pool.commit()
+        return partner
 
-async def find(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    profile = context.user_data.get(USER_DATA_KEY)
-    if not profile:
-        await update.message.reply_text("❌ You must create a profile first. Use /start.")
-        return
-    if user_id in active_chats:
-        await update.message.reply_text("💬 You're already in a chat. Use /skip or /stop.")
-        return
-    if user_id in waiting_queue:
-        await update.message.reply_text("⏳ Still searching… please wait.")
-        return
-
-    waiting_queue.add(user_id)
-    await update.message.reply_text("🔍 Searching for a match…")
-    await match_users(context.application)
-
-async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id in active_chats:
-        partner_id = active_chats[user_id]
-        await update.message.reply_text("💬 You're already in a chat! Say hi to your match.")
-        return
-    elif user_id in waiting_queue:
-        await update.message.reply_text("⏳ Still searching… please wait.")
-        return
-    else:
-        await update.message.reply_text("❌ You are not matched yet. Use /find to start searching.")
-
-async def stop_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id in active_chats:
-        await end_chat(user_id, context.application)
-        await update.message.reply_text("👋 You left the chat. Use /find to match again.")
-    elif user_id in waiting_queue:
-        waiting_queue.discard(user_id)
-        await update.message.reply_text("🛑 Search stopped.")
-    else:
-        await update.message.reply_text("❌ You're not in a chat or queue.")
-
-async def skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in active_chats:
-        await update.message.reply_text("❌ You're not in a chat to skip.")
-        return
-    await end_chat(user_id, context.application)
-    waiting_queue.add(user_id)
-    await update.message.reply_text("⏭️ Looking for someone new…")
-    await match_users(context.application)
-
-async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    partner_id = get_partner(user_id)
-    if not partner_id:
-        await update.message.reply_text("⚠️ You aren't chatting with anyone.")
-        return
-    reports[partner_id] += 1
-    await update.message.reply_text("🚩 Partner reported. Thank you.")
-    await end_chat(user_id, context.application)
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 <b>MateFinder Bot Commands:</b>\n\n"
-        "<b>/start</b> - Start the bot and create your profile\n"
-        "<b>/profile</b> - View your current profile\n"
-        "<b>/edit</b> - Edit your existing profile\n"
-        "<b>/find</b> - Browse potential matches\n"
-        "<b>/chat</b> - Start chatting with a matched user\n"
-        "<b>/cancel</b> - Cancel any current operation (profile/chat)\n"
-        "<b>/stop</b> - End the current chat\n"
-        "<b>/skip</b> - Next partner\n"
-        "<b>/report</b> - Report current partner\n"
-        "<b>/help</b> - Show help and commands\n"
-        "<b>/admin</b> - Admin panel (admins only)\n"
-        "<b>/broadcast</b> - Send message to all users (admins only)\n",
-        parse_mode=constants.ParseMode.HTML,
-    )
-
-async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("⛔ This command is for admins only.")
-        return
-    await update.message.reply_text(
-        "🛡️ <b>Admin Panel</b>\n"
-        f"Total users: {len(context.application.user_data)}\n"
-        f"Active chats: {len(active_chats) // 2}\n"
-        f"Waiting queue: {len(waiting_queue)}\n"
-        f"Reports: {sum(reports.values())}\n"
-        "Use /broadcast <msg> to send a message to all users.",
-        parse_mode=constants.ParseMode.HTML,
-    )
-
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("⛔ This command is for admins only.")
-        return
-    try:
-        msg = " ".join(context.args)
-        if not msg:
-            await update.message.reply_text("Usage: /broadcast <message>")
-            return
-        count = 0
-        for uid in context.application.user_data:
-            try:
-                await context.bot.send_message(uid, f"📢 <b>Admin Broadcast:</b>\n{msg}", parse_mode=constants.ParseMode.HTML)
-                count += 1
-            except Exception as e:
-                log.warning(f"Failed to send to {uid}: {e}")
-        await update.message.reply_text(f"Broadcast sent to {count} users.")
-    except Exception as e:
-        await update.message.reply_text(f"Broadcast failed: {e}")
-
-async def edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    prof = context.user_data.get(USER_DATA_KEY)
-    if not prof:
-        await update.message.reply_text("❌ You don't have a profile yet. Use /start to create one.")
-        return ConversationHandler.END
-    await update.message.reply_text(
-        "📝 What do you want to edit?\n"
-        "Choose gender to edit your gender, or preference to edit who you'd like to meet.",
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("Gender", callback_data="edit_gender"),
-                    InlineKeyboardButton("Preference", callback_data="edit_pref"),
-                ]
-            ]
-        ),
-    )
-    return RegState.EDIT_GENDER
-
-async def edit_gender_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(
-        "Select your new gender:",
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("♂️ Male", callback_data="g_male"),
-                    InlineKeyboardButton("♀️ Female", callback_data="g_female"),
-                ],
-                [InlineKeyboardButton("⚧️ Other", callback_data="g_other")],
-            ]
-        ),
-    )
-    return RegState.GENDER
-
-async def edit_pref_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(
-        "Who would you like to meet?",
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("♂️ Male", callback_data="p_male"),
-                    InlineKeyboardButton("♀️ Female", callback_data="p_female"),
-                ],
-                [InlineKeyboardButton("🤝 Anyone", callback_data="p_any")],
-            ]
-        ),
-    )
-    return RegState.PREF
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    # Remove from waiting queue or end chat if active
-    if user_id in waiting_queue:
-        waiting_queue.discard(user_id)
-        await update.message.reply_text("❌ Operation cancelled and removed from queue.")
-    elif user_id in active_chats:
-        await end_chat(user_id, context.application)
-        await update.message.reply_text("❌ Operation cancelled and chat ended.")
-    else:
-        await update.message.reply_text("❌ No operation to cancel.")
-    return ConversationHandler.END
-
-async def relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    partner_id = get_partner(user_id)
-    if not partner_id:
-        await update.message.reply_text(
-            "ℹ️ Not in a chat.\nUse /find to meet someone."
+    # ---------- reports ----------
+    async def add_report(self, reporter:int, reported:int, reason:str):
+        await self._pool.execute(
+            "INSERT INTO reports(reporter,reported,reason,ts) VALUES(?,?,?,?)",
+            (reporter, reported, reason, datetime.utcnow())
         )
-        return
-    # Relay text, stickers, or photo
-    if update.message.sticker:
-        await context.bot.send_sticker(partner_id, update.message.sticker.file_id)
-    elif update.message.photo:
-        photo = update.message.photo[-1]  # highest resolution
-        caption = update.message.caption_html or ""
-        await context.bot.send_photo(partner_id, photo.file_id, caption=caption, parse_mode=constants.ParseMode.HTML)
-    elif update.message.text:
-        await context.bot.send_message(partner_id, update.message.text_html, parse_mode=constants.ParseMode.HTML)
+        await self._pool.commit()
+
+db = DB(DB_FILE)
+
+###############################################################################
+#                             2.  FSM STATES                                  #
+###############################################################################
+class Onboard(StatesGroup):
+    name = State()
+    gender = State()
+    age = State()
+    bio = State()
+    photo = State()
+
+class ReportState(StatesGroup):
+    reason = State()
+
+###############################################################################
+#                         3.  HELPER FUNCTIONS                                #
+###############################################################################
+def gender_kb(selected: Optional[str] = None):
+    kb = InlineKeyboardBuilder()
+    for g in (Gender.male, Gender.female, Gender.other):
+        label = ("✅ " if g == selected else "") + g.capitalize()
+        kb.button(text=label, callback_data=f"gender:{g}")
+    kb.adjust(3)
+    return kb.as_markup()
+
+async def send_system(chat_id: int, text: str, bot: Bot):
+    await bot.send_message(chat_id, f"⚠️ *System*: {text}", parse_mode="Markdown")
+
+async def is_in_chat(user_id:int)->bool:
+    return await db.get_partner(user_id) is not None
+
+###############################################################################
+#                          4.  MAIN ROUTER & HANDLERS                          #
+###############################################################################
+router = Router(name="matefinder")
+
+# ----- /start -----
+@router.message(CommandStart())
+async def cmd_start(msg: types.Message, state: FSMContext):
+    await db.add_user_if_not_exists(msg.from_user.id)
+    profile = await db.get_profile(msg.from_user.id)
+    if profile["name"]:
+        await msg.answer("👋 Welcome back to *MateFinder*!\nUse /find to get matched.",
+                         parse_mode="Markdown")
     else:
-        await update.message.reply_text("⚠️ Unsupported message type.")
+        await msg.answer("👋 Hi! Let's create your profile.\nWhat's your *name*?",
+                         parse_mode="Markdown")
+        await state.set_state(Onboard.name)
 
-# ---------- Main ----------
-def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+# ----- Onboarding flow -----
+@router.message(Onboard.name)
+async def onboard_name(msg: types.Message, state: FSMContext):
+    await state.update_data(name=msg.text.strip()[:32])
+    await msg.answer("Select your *gender*:", reply_markup=gender_kb(), parse_mode="Markdown")
+    await state.set_state(Onboard.gender)
 
-    # Registration and editing conversation
-    conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("start", start),
-            CommandHandler("edit", edit),
-        ],
-        states={
-            RegState.GENDER: [CallbackQueryHandler(gender_choice, pattern="^g_")],
-            RegState.PREF: [CallbackQueryHandler(pref_choice, pattern="^p_")],
-            RegState.EDIT_GENDER: [
-                CallbackQueryHandler(edit_gender_choice, pattern="^edit_gender$"),
-                CallbackQueryHandler(edit_pref_choice, pattern="^edit_pref$"),
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            CommandHandler("help", help_cmd),
-            CommandHandler("start", start),
-        ],
+@router.callback_query(StateFilter(Onboard.gender), F.data.startswith("gender:"))
+async def onboard_gender(cb: types.CallbackQuery, state: FSMContext):
+    gender = cb.data.split(":")[1]
+    await state.update_data(gender=gender)
+    await cb.message.edit_text("Great! How *old* are you?")
+    await state.set_state(Onboard.age)
+    await cb.answer()
+
+@router.message(Onboard.age)
+async def onboard_age(msg: types.Message, state: FSMContext):
+    if not msg.text.isdigit() or not 13 <= int(msg.text) <= 99:
+        return await msg.reply("Please send a valid age (13-99).")
+    await state.update_data(age=int(msg.text))
+    await msg.answer("Write a short *bio* (max 120 chars):", parse_mode="Markdown")
+    await state.set_state(Onboard.bio)
+
+@router.message(Onboard.bio)
+async def onboard_bio(msg: types.Message, state: FSMContext):
+    await state.update_data(bio=msg.text.strip()[:120])
+    await msg.answer("Send me a *profile photo* (or /skip):", parse_mode="Markdown")
+    await state.set_state(Onboard.photo)
+
+@router.message(Onboard.photo, F.photo)
+async def onboard_photo(msg: types.Message, state: FSMContext):
+    await state.update_data(photo=msg.photo[-1].file_id)
+    data = await state.get_data()
+    await db.update_profile(msg.from_user.id, **data)
+    await state.clear()
+    await msg.answer("✅ Profile saved! Use /find to get matched.")
+
+@router.message(Onboard.photo, Command("skip"))
+async def onboard_skip_photo(msg: types.Message, state: FSMContext):
+    data = await state.get_data()
+    await db.update_profile(msg.from_user.id, **data)
+    await state.clear()
+    await msg.answer("✅ Profile saved without photo! Use /find to get matched.")
+
+# ----- /profile -----
+@router.message(Command("profile"))
+async def cmd_profile(msg: types.Message):
+    profile = await db.get_profile(msg.from_user.id)
+    if not profile["name"]:
+        return await msg.reply("You don't have a profile yet. Use /start.")
+    text = (
+        f"*Name*: {profile['name']}\n"
+        f"*Gender*: {profile['gender']}\n"
+        f"*Age*: {profile['age']}\n"
+        f"*Bio*: {profile['bio']}\n"
+        f"*Prefers*: {profile['pref']}"
     )
-    app.add_handler(conv)
+    await msg.answer_photo(profile["photo"] or "", caption=text, parse_mode="Markdown", 
+                           reply_markup=settings_kb())
 
-    # Chat commands
-    app.add_handler(CommandHandler("find", find))
-    app.add_handler(CommandHandler("chat", chat))
-    app.add_handler(CommandHandler("stop", stop_chat))
-    app.add_handler(CommandHandler("skip", skip))
-    app.add_handler(CommandHandler("report", report))
-    app.add_handler(CommandHandler("profile", profile))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("admin", admin))
-    app.add_handler(CommandHandler("broadcast", broadcast))
-    app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(CommandHandler("edit", edit))
+# inline keyboard to change settings
+def settings_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⚙️ Gender Preference", callback_data="chg_pref")
+    kb.adjust(1)
+    return kb.as_markup()
 
-    # Message relay
-    app.add_handler(
-        MessageHandler(filters.TEXT | filters.Sticker.ALL | filters.PHOTO, relay)
-    )
+@router.callback_query(F.data == "chg_pref")
+async def cb_pref(cb: types.CallbackQuery):
+    profile = await db.get_profile(cb.from_user.id)
+    await cb.message.edit_reply_markup(reply_markup=gender_kb(profile["pref"]))
+    await cb.answer("Pick your preferred partner gender!")
 
-    log.info("Bot started…")
-    app.run_polling()
+@router.callback_query(F.data.startswith("gender:"))
+async def cb_set_pref(cb: types.CallbackQuery):
+    pref = cb.data.split(":")[1]
+    await db.update_profile(cb.from_user.id, pref=pref)
+    await cb.answer("Preference updated!")
+    await cb.message.edit_reply_markup(reply_markup=None)
+
+# ----- /find and /next -----
+@router.message(Command(commands=("find", "next")))
+async def cmd_find(msg: types.Message, bot: Bot):
+    if await is_in_chat(msg.from_user.id):
+        # leave current chat first
+        partner = await db.end_chat(msg.from_user.id)
+        if partner:
+            await send_system(partner, "Your partner left the chat.", bot)
+    await db.enqueue(msg.from_user.id)
+    partner = await db.pop_match(msg.from_user.id)
+    if partner:
+        await bot.send_message(partner, "🎉 You are now connected! Say hi!")
+        await bot.send_message(msg.from_user.id, "🎉 You are now connected! Say hi!")
+    else:
+        await msg.answer("⌛ Waiting for a partner… Use /stop to cancel.")
+
+# ----- /stop -----
+@router.message(Command("stop"))
+async def cmd_stop(msg: types.Message, bot: Bot):
+    if await is_in_chat(msg.from_user.id):
+        partner = await db.end_chat(msg.from_user.id)
+        if partner:
+            await send_system(partner, "Partner ended the chat.", bot)
+        await msg.answer("🔕 Chat ended. Use /find to match again.")
+    else:
+        await db.dequeue(msg.from_user.id)
+        await msg.answer("🚫 Queue cleared.")
+
+# ----- Relay chat messages -----
+@router.message()
+async def relay(msg: types.Message, bot: Bot):
+    partner = await db.get_partner(msg.from_user.id)
+    if not partner:
+        return  # ignore stray messages
+    # copy almost any content
+    if msg.content_type == "text":
+        await bot.send_message(partner, msg.text)
+    elif msg.content_type == "photo":
+        await bot.send_photo(partner, msg.photo[-1].file_id, caption=msg.caption)
+    elif msg.content_type == "sticker":
+        await bot.send_sticker(partner, msg.sticker.file_id)
+    else:
+        await msg.reply("Unsupported message type.")
+
+# ----- /report flow -----
+@router.message(Command("report"))
+async def cmd_report(msg: types.Message, state:FSMContext):
+    if not await is_in_chat(msg.from_user.id):
+        return await msg.reply("You can only report while in a chat.")
+    await msg.reply("Please describe the issue briefly:")
+    await state.set_state(ReportState.reason)
+
+@router.message(ReportState.reason)
+async def report_reason(msg: types.Message, state:FSMContext, bot: Bot):
+    partner = await db.get_partner(msg.from_user.id)
+    await db.add_report(msg.from_user.id, partner, msg.text[:250])
+    await send_system(partner, "You were reported and disconnected.", bot)
+    await db.end_chat(msg.from_user.id)
+    await state.clear()
+    await msg.answer("✅ Report submitted. You have left the chat.")
+
+# ----- /help -----
+HELP = """
+*MateFinder Commands*
+/start   – Create profile / restart bot
+/find    – Enter matchmaking queue
+/next    – Skip current partner & match new
+/stop    – Leave chat or queue
+/profile – View your profile
+/settings– Set gender preference
+/report  – Report current partner
+/help    – Show this help
+"""
+
+@router.message(Command("help"))
+async def cmd_help(msg: types.Message):
+    await msg.answer(HELP, parse_mode="Markdown")
+
+###############################################################################
+#                            5.  RUN EVERYTHING                               #
+###############################################################################
+async def main():
+    await db.init()
+    bot = Bot(BOT_TOKEN, parse_mode="HTML")
+    dp = Dispatcher()
+    dp.include_router(router)
+
+    log.info("Bot started")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
