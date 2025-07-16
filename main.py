@@ -16,7 +16,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ======== CONFIG ========
 BOT_TOKEN = "7620053279:AAFfGVyoXsL5nOL0U5DcmDG4QDsW3XYb6t4"
-OPENAI_API_KEY = "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"  # Replace with your real OpenAI key
+OPENAI_API_KEY = "OPEN_KEY"  # Replace with your real OpenAI key
 openai.api_key = OPENAI_API_KEY
 
 SUPPORTED_LANGUAGES = [
