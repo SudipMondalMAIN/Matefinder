@@ -146,7 +146,7 @@ async def age(m: types.Message, state: FSMContext):
 async def got_gender(cb: types.CallbackQuery, state: FSMContext):
     g = cb.data.split(":")[1]
     await state.update_data(gender=g)
-    await cb.message.edit_text("Preferred partner gender (or other/any)?", reply_markup=gender_kb())
+    # Removed: Preferred partner gender (or other/any)?
     await state.set_state(Onboard.pref)
     await cb.answer()
 
