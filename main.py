@@ -11,7 +11,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # === CONFIG ===
-BOT_TOKEN = os.environ.get("7620053279:AAGV0usPRt-8Q_TyQMhmZme0Y1h-XBoovCw")  # Use environment variable for safety!
+BOT_TOKEN = os.environ.get("7620053279:AAGCR8skkDQt5rRvVMZVNSQtwvQeZVJRt6U")  # Use environment variable for safety!
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("Matefinder")
