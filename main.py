@@ -15,8 +15,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ======== CONFIG ========
-BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-OPENAI_API_KEY = "sk-XXXX..."  # Replace with your real OpenAI key
+BOT_TOKEN = "7620053279:AAFfGVyoXsL5nOL0U5DcmDG4QDsW3XYb6t4"
+OPENAI_API_KEY = "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"  # Replace with your real OpenAI key
 openai.api_key = OPENAI_API_KEY
 
 SUPPORTED_LANGUAGES = [
