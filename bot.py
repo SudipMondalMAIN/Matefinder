@@ -34,7 +34,7 @@ from telegram.ext import (
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN")
+    raise RuntimeError("7620053279:AAFfGVyoXsL5nOL0U5DcmDG4QDsW3XYb6t4")
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
