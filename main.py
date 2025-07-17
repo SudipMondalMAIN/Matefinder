@@ -14,7 +14,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 # ------- CONFIGURATION --------
 BOT_TOKEN = "7620053279:AAGUu17xi-1ZXCTcuRQI5P9T-E7gS5U3B24"        # <-- PUT BOT TOKEN HERE
-ADMIN_USER_ID = 6535216093                # <-- PUT YOURtg USER ID HERE (for /admin)
+ADMIN_USER_ID = 6535216093                # <-- PUT YOUR TELEGRAM USER ID HERE (for /admin)
 DB_NAME = "matefinder.db"
 
 # ------- LOGGING -------------
@@ -36,6 +36,7 @@ class User:
     bio: str
     created_at: str
     is_admin: bool = False
+    photo_id: str = None
 
 # ------- DB MANAGER ---------
 class DatabaseManager:
@@ -45,7 +46,7 @@ class DatabaseManager:
     def init_database(self):
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
-        # User table (no gender interest)
+        # User table (with profile picture)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -56,7 +57,8 @@ class DatabaseManager:
                 created_at TEXT NOT NULL,
                 is_admin BOOLEAN DEFAULT FALSE,
                 is_searching BOOLEAN DEFAULT FALSE,
-                current_partner_id INTEGER DEFAULT NULL
+                current_partner_id INTEGER DEFAULT NULL,
+                photo_id TEXT
             )
         ''')
         cursor.execute('''
@@ -95,17 +97,20 @@ class DatabaseManager:
         result = cursor.fetchone()
         conn.close()
         if result:
-            return User(result[0], result[1], result[2], result[3], result[4], result[5], bool(result[6]))
+            return User(
+                result[0], result[1], result[2], result[3], result[4],
+                result[5], bool(result[6]), result[10] if len(result) > 10 else None
+            )
         return None
-    def create_user(self, user_id: int, name: str, age: int, gender: str, bio: str) -> bool:
+    def create_user(self, user_id: int, name: str, age: int, gender: str, bio: str, photo_id: str) -> bool:
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
         try:
             is_admin = user_id == ADMIN_USER_ID
             cursor.execute('''
-                INSERT INTO users (user_id, name, age, gender, bio, created_at, is_admin)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (user_id, name, age, gender, bio, datetime.now().isoformat(), is_admin))
+                INSERT INTO users (user_id, name, age, gender, bio, created_at, is_admin, photo_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (user_id, name, age, gender, bio, datetime.now().isoformat(), is_admin, photo_id))
             conn.commit()
             return True
         except sqlite3.IntegrityError:
@@ -247,7 +252,7 @@ class DatabaseManager:
     def get_current_partner(self, user_id: int) -> Optional[int]:
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
-        cursor.execute('SELECT current_partner_id FROM users WHERE user_id = ?', (user_id,))
+        cursor.execute('SELECT current_partner_id, photo_id FROM users WHERE user_id = ?', (user_id,))
         result = cursor.fetchone()
         conn.close()
         return result[0] if result and result[0] else None
@@ -261,6 +266,7 @@ class ProfileStates(StatesGroup):
     editing_age = State()
     editing_gender = State()
     editing_bio = State()
+    editing_photo = State()
 
 # ------- Inline Keyboards ----
 def create_gender_keyboard():
@@ -274,7 +280,8 @@ def create_profile_keyboard():
         [InlineKeyboardButton(text="✏️ Edit Name", callback_data="edit_name")],
         [InlineKeyboardButton(text="🎂 Edit Age", callback_data="edit_age")],
         [InlineKeyboardButton(text="⚧️ Edit Gender", callback_data="edit_gender")],
-        [InlineKeyboardButton(text="📝 Edit Bio", callback_data="edit_bio")]
+        [InlineKeyboardButton(text="📝 Edit Bio", callback_data="edit_bio")],
+        [InlineKeyboardButton(text="🖼️ Edit Photo", callback_data="edit_photo")]
     ])
 def create_admin_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -316,7 +323,10 @@ async def cmd_profile(message: Message):
         f"📝 Bio: {user.bio}\n\n"
         f"📅 Joined: {user.created_at.split('T')[0]}"
     )
-    await message.answer(profile_text, reply_markup=create_profile_keyboard(), parse_mode="Markdown")
+    if user.photo_id:
+        await message.answer_photo(user.photo_id, caption=profile_text, parse_mode="Markdown", reply_markup=create_profile_keyboard())
+    else:
+        await message.answer(profile_text, parse_mode="Markdown", reply_markup=create_profile_keyboard())
 
 @router.message(Command("edit"))
 async def cmd_edit(message: Message):
@@ -498,7 +508,8 @@ async def handle_edit_selection(callback: CallbackQuery, state: FSMContext):
         "edit_name": ("editing_name", "Please enter your new name:"),
         "edit_age": ("editing_age", "Please enter your new age:"),
         "edit_gender": ("editing_gender", "Please select your gender:"),
-        "edit_bio": ("editing_bio", "Please enter your new bio:")
+        "edit_bio": ("editing_bio", "Please enter your new bio:"),
+        "edit_photo": ("editing_photo", "Send your new profile picture or /skip to remove.")
     }
     if callback.data in edit_map:
         state_name, message_text = edit_map[callback.data]
@@ -560,26 +571,91 @@ async def process_bio(message: Message, state: FSMContext):
         await message.answer(f"✅ Bio updated!")
         await state.clear()
     else:
-        data = await state.get_data()
-        if db.create_user(
-            user_id=user_id,
-            name=data['name'],
-            age=data['age'],
-            gender=data['gender'],
-            bio=bio
-        ):
-            await message.answer(
-                f"🎉 Profile created successfully!\n\n"
-                f"📛 Name: {data['name']}\n"
-                f"🎂 Age: {data['age']}\n"
-                f"⚧️ Gender: {data['gender']}\n"
-                f"📝 Bio: {bio}\n\n"
-                f"🔍 Use /find to start looking for matches!\n"
-                f"✏️ Use /edit to modify your profile anytime."
-            )
-        else:
-            await message.answer("❌ Failed to create profile. Please try again with /start")
-        await state.clear()
+        await state.update_data(bio=bio)
+        await message.answer(
+            "Would you like to add a profile picture?\nSend me a photo, or type /skip."
+        )
+        await state.set_state(ProfileStates.editing_photo)
+
+@router.message(ProfileStates.editing_photo, F.photo)
+async def process_photo(message: Message, state: FSMContext):
+    photo_id = message.photo[-1].file_id
+    await state.update_data(photo_id=photo_id)
+    data = await state.get_data()
+    user_id = message.from_user.id
+    created = db.create_user(
+        user_id=user_id,
+        name=data['name'],
+        age=data['age'],
+        gender=data['gender'],
+        bio=data['bio'],
+        photo_id=photo_id
+    )
+    if created:
+        profile_text = (
+            f"🎉 Profile created successfully!\n\n"
+            f"📛 Name: {data['name']}\n"
+            f"🎂 Age: {data['age']}\n"
+            f"⚧️ Gender: {data['gender']}\n"
+            f"📝 Bio: {data['bio']}\n"
+            f"🖼️ Photo: [see above]\n\n"
+            f"🔍 Use /find to start looking for matches!\n"
+            f"✏️ Use /edit to modify your profile anytime."
+        )
+        await message.answer_photo(photo_id, caption=profile_text)
+    else:
+        await message.answer("❌ Failed to create profile. Please try again with /start")
+    await state.clear()
+
+@router.message(ProfileStates.editing_photo, F.text & F.text.lower() == "/skip")
+async def process_skip_photo(message: Message, state: FSMContext):
+    data = await state.get_data()
+    user_id = message.from_user.id
+    created = db.create_user(
+        user_id=user_id,
+        name=data['name'],
+        age=data['age'],
+        gender=data['gender'],
+        bio=data['bio'],
+        photo_id=None
+    )
+    if created:
+        await message.answer(
+            f"🎉 Profile created successfully!\n\n"
+            f"📛 Name: {data['name']}\n"
+            f"🎂 Age: {data['age']}\n"
+            f"⚧️ Gender: {data['gender']}\n"
+            f"📝 Bio: {data['bio']}\n\n"
+            f"🔍 Use /find to start looking for matches!\n"
+            f"✏️ Use /edit to modify your profile anytime."
+        )
+    else:
+        await message.answer("❌ Failed to create profile. Please try again with /start")
+    await state.clear()
+
+@router.message(ProfileStates.editing_photo, F.text)
+async def process_photo_text_invalid(message: Message, state: FSMContext):
+    await message.answer("❌ Please send a photo or type /skip.")
+
+# Add for photo edit as well in profile editing
+@router.message(ProfileStates.editing_photo, F.photo)
+async def update_profile_photo(message: Message, state: FSMContext):
+    photo_id = message.photo[-1].file_id
+    user_id = message.from_user.id
+    db.update_user_field(user_id, 'photo_id', photo_id)
+    await message.answer("✅ Photo updated!")
+    await state.clear()
+
+@router.message(ProfileStates.editing_photo, F.text & F.text.lower() == "/skip")
+async def clear_profile_photo(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    db.update_user_field(user_id, 'photo_id', None)
+    await message.answer("✅ Profile photo removed!")
+    await state.clear()
+
+@router.message(ProfileStates.editing_photo, F.text)
+async def invalid_edit_photo_text(message: Message, state: FSMContext):
+    await message.answer("❌ Please send a photo or type /skip.")
 
 # ------- CHAT RELAY HANDLER ---------
 @router.message(F.text & ~F.text.startswith('/'))
@@ -601,6 +677,25 @@ async def handle_chat_message(message: Message):
             "🔍 Use /find to search for a match!"
         )
 
+@router.message(F.photo)
+async def handle_photo_chat(message: Message):
+    user_id = message.from_user.id
+    partner_id = db.get_current_partner(user_id)
+    if partner_id:
+        try:
+            await bot.send_photo(
+                partner_id,
+                photo=message.photo[-1].file_id,
+                caption="(Photo from your chat partner)"
+            )
+        except Exception as e:
+            logger.error(f"Photo relay fail: {e}")
+    else:
+        await message.answer(
+            "❌ You're not currently in a chat.\n"
+            "🔍 Use /find to search for a match!"
+        )
+
 # ------- DISPATCHER ----------
 dp.include_router(router)
 
@@ -610,4 +705,4 @@ async def main():
     await dp.start_polling(bot)
 if __name__ == "__main__":
     asyncio.run(main())
-
+        
