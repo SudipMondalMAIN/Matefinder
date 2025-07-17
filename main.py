@@ -6,27 +6,25 @@ from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile,
+)
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# ------- CONFIGURATION --------
-BOT_TOKEN = "7620053279:AAGUu17xi-1ZXCTcuRQI5P9T-E7gS5U3B24"        # <-- PUT BOT TOKEN HERE
-ADMIN_USER_ID = 6535216093                # <-- PUT YOUR TELEGRAM USER ID HERE (for /admin)
+BOT_TOKEN = "7620053279:AAGUu17xi-1ZXCTcuRQI5P9T-E7gS5U3B24"
+ADMIN_USER_ID = 6535216093
 DB_NAME = "matefinder.db"
 
-# ------- LOGGING -------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ------- AIOGRAM INIT -------
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 
-# ------- USER MODEL ---------
 @dataclass
 class User:
     user_id: int
@@ -38,15 +36,15 @@ class User:
     is_admin: bool = False
     photo_id: str = None
 
-# ------- DB MANAGER ---------
 class DatabaseManager:
     def __init__(self, db_name: str):
         self.db_name = db_name
         self.init_database()
+
     def init_database(self):
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
-        # User table (with profile picture)
+        # User profiles
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -56,11 +54,11 @@ class DatabaseManager:
                 bio TEXT,
                 created_at TEXT NOT NULL,
                 is_admin BOOLEAN DEFAULT FALSE,
-                is_searching BOOLEAN DEFAULT FALSE,
                 current_partner_id INTEGER DEFAULT NULL,
                 photo_id TEXT
             )
         ''')
+        # Active chats (mutual like)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS active_chats (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,6 +68,7 @@ class DatabaseManager:
                 is_active BOOLEAN DEFAULT TRUE
             )
         ''')
+        # Reports
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS reports (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -79,6 +78,25 @@ class DatabaseManager:
                 created_at TEXT NOT NULL
             )
         ''')
+        # Pending (one-sided) likes
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS pending_likes (
+                liker_id INTEGER NOT NULL,
+                liked_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (liker_id, liked_id)
+            )
+        ''')
+        # Skips (to not show this user to that user again for a while)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS skips (
+                user_id INTEGER NOT NULL,
+                skipped_user_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, skipped_user_id)
+            )
+        ''')
+        # Blocked (report/ban)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS blocked_matches (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -89,7 +107,7 @@ class DatabaseManager:
         ''')
         conn.commit()
         conn.close()
-    # --- User handling ---
+
     def get_user(self, user_id: int) -> Optional[User]:
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
@@ -99,10 +117,11 @@ class DatabaseManager:
         if result:
             return User(
                 result[0], result[1], result[2], result[3], result[4],
-                result[5], bool(result[6]), result[10] if len(result) > 10 else None
+                result[5], bool(result[6]), result[8] if len(result) > 8 else None
             )
         return None
-    def create_user(self, user_id: int, name: str, age: int, gender: str, bio: str, photo_id: str) -> bool:
+
+    def create_user(self, user_id: int, name: str, age: int, gender: str, bio: str, photo_id: Optional[str]) -> bool:
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
         try:
@@ -117,6 +136,7 @@ class DatabaseManager:
             return False
         finally:
             conn.close()
+
     def update_user_field(self, user_id: int, field: str, value: Any) -> bool:
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
@@ -129,33 +149,8 @@ class DatabaseManager:
             return False
         finally:
             conn.close()
-    def set_user_searching(self, user_id: int, searching: bool):
-        self.update_user_field(user_id, 'is_searching', int(searching))
-    def clear_partner(self, user_id: int):
-        self.update_user_field(user_id, 'current_partner_id', None)
-    # --- Matchmaking (anyone except blocked/skipped) ---
-    def find_match(self, user_id: int) -> Optional[int]:
-        conn = sqlite3.connect(self.db_name)
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT user_id FROM users 
-            WHERE user_id != ?
-            AND is_searching = TRUE
-            AND user_id NOT IN (
-                SELECT blocked_user_id FROM blocked_matches WHERE user_id = ?
-            )
-            AND user_id NOT IN (
-                SELECT user_id FROM blocked_matches WHERE blocked_user_id = ?
-            )
-            AND current_partner_id IS NULL
-            ORDER BY RANDOM()
-            LIMIT 1
-        ''', (user_id, user_id, user_id))
-        result = cursor.fetchone()
-        conn.close()
-        return result[0] if result else None
-    # --- Chat management ---
-    def create_chat(self, user1_id: int, user2_id: int) -> bool:
+
+    def set_in_chat(self, user1_id: int, user2_id: int) -> bool:
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
         try:
@@ -164,20 +159,19 @@ class DatabaseManager:
                 VALUES (?, ?, ?)
             ''', (user1_id, user2_id, datetime.now().isoformat()))
             cursor.execute('''
-                UPDATE users SET is_searching = FALSE, current_partner_id = ?
-                WHERE user_id = ?
+                UPDATE users SET current_partner_id = ? WHERE user_id = ?
             ''', (user2_id, user1_id))
             cursor.execute('''
-                UPDATE users SET is_searching = FALSE, current_partner_id = ?
-                WHERE user_id = ?
+                UPDATE users SET current_partner_id = ? WHERE user_id = ?
             ''', (user1_id, user2_id))
             conn.commit()
             return True
         except Exception as e:
-            logger.error(f"Create chat error: {e}")
+            logger.error(f"Set in chat error: {e}")
             return False
         finally:
             conn.close()
+
     def end_chat(self, user_id: int) -> Optional[int]:
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
@@ -191,8 +185,7 @@ class DatabaseManager:
                     WHERE (user1_id = ? AND user2_id = ?) OR (user1_id = ? AND user2_id = ?)
                 ''', (user_id, partner_id, partner_id, user_id))
                 cursor.execute('''
-                    UPDATE users SET current_partner_id = NULL, is_searching = FALSE
-                    WHERE user_id IN (?, ?)
+                    UPDATE users SET current_partner_id = NULL WHERE user_id IN (?, ?)
                 ''', (user_id, partner_id))
                 conn.commit()
                 return partner_id
@@ -202,7 +195,21 @@ class DatabaseManager:
             return None
         finally:
             conn.close()
-    # --- Block ---
+
+    def skip_user(self, user_id: int, target_id: int):
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                INSERT OR IGNORE INTO skips (user_id, skipped_user_id, created_at)
+                VALUES (?, ?, ?)
+            ''', (user_id, target_id, datetime.now().isoformat()))
+            conn.commit()
+        except Exception as e:
+            logger.error(f"Skip user error: {e}")
+        finally:
+            conn.close()
+
     def block_user(self, user_id: int, blocked_user_id: int):
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
@@ -213,10 +220,10 @@ class DatabaseManager:
             ''', (user_id, blocked_user_id, datetime.now().isoformat()))
             conn.commit()
         except Exception as e:
-            logger.error(f"Block err: {e}")
+            logger.error(f"Block user error: {e}")
         finally:
             conn.close()
-    # --- Report ---
+
     def report_user(self, reporter_id: int, reported_id: int, reason: str):
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
@@ -227,10 +234,84 @@ class DatabaseManager:
             ''', (reporter_id, reported_id, reason, datetime.now().isoformat()))
             conn.commit()
         except Exception as e:
-            logger.error(f"Report err: {e}")
+            logger.error(f"Report user error: {e}")
         finally:
             conn.close()
-    # --- Stats/Admin ---
+
+    def add_pending_like(self, liker_id: int, liked_id: int):
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                INSERT OR IGNORE INTO pending_likes (liker_id, liked_id, created_at)
+                VALUES (?, ?, ?)
+            ''', (liker_id, liked_id, datetime.now().isoformat()))
+            conn.commit()
+        except Exception as e:
+            logger.error(f"Pending like error: {e}")
+        finally:
+            conn.close()
+
+    def pending_like_exists(self, liker_id: int, liked_id: int) -> bool:
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT 1 FROM pending_likes WHERE liker_id = ? AND liked_id = ?', (liker_id, liked_id)
+        )
+        result = cursor.fetchone()
+        conn.close()
+        return bool(result)
+
+    def remove_pending_like(self, liker_id: int, liked_id: int):
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+        cursor.execute(
+            'DELETE FROM pending_likes WHERE (liker_id = ? AND liked_id = ?) OR (liker_id = ? AND liked_id = ?)',
+            (liker_id, liked_id, liked_id, liker_id)
+        )
+        conn.commit()
+        conn.close()
+
+    def get_next_profile(self, user_id: int) -> Optional[User]:
+        """Return the next profile user can view/like/skip (not self, not in chat, not skipped, not reported, not currently blocked)"""
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM users
+            WHERE user_id != ?
+            AND current_partner_id IS NULL
+            AND user_id NOT IN (
+                SELECT skipped_user_id FROM skips WHERE user_id = ?
+            )
+            AND user_id NOT IN (
+                SELECT reported_id FROM reports WHERE reporter_id = ?
+            )
+            AND user_id NOT IN (
+                SELECT blocked_user_id FROM blocked_matches WHERE user_id = ?
+            )
+            AND user_id NOT IN (
+                SELECT blocked_user_id FROM blocked_matches WHERE blocked_user_id = ?
+            )
+            ORDER BY RANDOM()
+            LIMIT 1
+        ''', (user_id, user_id, user_id, user_id, user_id))
+        result = cursor.fetchone()
+        conn.close()
+        if result:
+            return User(
+                result[0], result[1], result[2], result[3], result[4],
+                result[5], bool(result[6]), result[8] if len(result) > 8 else None
+            )
+        return None
+
+    def get_current_partner(self, user_id: int) -> Optional[int]:
+        conn = sqlite3.connect(self.db_name)
+        cursor = conn.cursor()
+        cursor.execute('SELECT current_partner_id FROM users WHERE user_id = ?', (user_id,))
+        result = cursor.fetchone()
+        conn.close()
+        return result[0] if result else None
+
     def get_stats(self) -> Dict[str, int]:
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
@@ -242,25 +323,9 @@ class DatabaseManager:
         total_reports = cursor.fetchone()[0]
         conn.close()
         return {'total_users': total_users, 'active_chats': active_chats, 'total_reports': total_reports}
-    def get_all_users(self) -> List[int]:
-        conn = sqlite3.connect(self.db_name)
-        cursor = conn.cursor()
-        cursor.execute('SELECT user_id FROM users')
-        results = cursor.fetchall()
-        conn.close()
-        return [row[0] for row in results]
-    def get_current_partner(self, user_id: int) -> Optional[int]:
-        conn = sqlite3.connect(self.db_name)
-        cursor = conn.cursor()
-        cursor.execute('SELECT current_partner_id, photo_id FROM users WHERE user_id = ?', (user_id,))
-        result = cursor.fetchone()
-        conn.close()
-        return result[0] if result and result[0] else None
 
-# ------- DB INIT -------------
 db = DatabaseManager(DB_NAME)
 
-# ------- FSM STATES ----------
 class ProfileStates(StatesGroup):
     editing_name = State()
     editing_age = State()
@@ -268,7 +333,6 @@ class ProfileStates(StatesGroup):
     editing_bio = State()
     editing_photo = State()
 
-# ------- Inline Keyboards ----
 def create_gender_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👨 Male", callback_data="gender_male")],
@@ -288,8 +352,14 @@ def create_admin_keyboard():
         [InlineKeyboardButton(text="📊 Statistics", callback_data="admin_stats")],
         [InlineKeyboardButton(text="📢 Broadcast", callback_data="admin_broadcast")]
     ])
+def like_skip_keyboard(target_user_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="👍 Like", callback_data=f"like_user_{target_user_id}"),
+            InlineKeyboardButton(text="⏭️ Skip", callback_data=f"skip_user_{target_user_id}")
+        ]
+    ])
 
-# ------- COMMAND HANDLERS ----
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     user_id = message.from_user.id
@@ -342,45 +412,116 @@ async def cmd_edit(message: Message):
     )
 
 @router.message(Command("find"))
-async def cmd_find(message: Message):
+async def cmd_find(message: Message, state: FSMContext):
     user_id = message.from_user.id
     user = db.get_user(user_id)
     if not user:
         await message.answer("❌ Please start the bot first with /start")
         return
+
     if db.get_current_partner(user_id):
         await message.answer("❌ You're already in a chat! Use /stop to end it first.")
         return
-    db.set_user_searching(user_id, True)
-    await message.answer("🔍 Searching for a match... Please wait.")
-    match_id = db.find_match(user_id)
-    if match_id:
-        if db.create_chat(user_id, match_id):
-            await message.answer(
-                "🎉 Match found! You can now start chatting.\n\n"
-                "💬 Send any message to chat with your partner\n"
-                "🚫 Use /stop to end the chat\n"
-                "⏭️ Use /skip to find a new partner\n"
-                "🚨 Use /report to report inappropriate behavior"
+    candidate = db.get_next_profile(user_id)
+    if not candidate:
+        await message.answer("😔 No profiles to show right now. Please try again later.")
+        return
+    await state.update_data(last_candidate_id=candidate.user_id)
+    cap = (
+        f"📛 Name: {candidate.name}\n"
+        f"🎂 Age: {candidate.age}\n"
+        f"⚧️ Gender: {candidate.gender}\n"
+        f"📝 Bio: {candidate.bio}\n\n"
+        "Like or skip:"
+    )
+    if candidate.photo_id:
+        await message.answer_photo(candidate.photo_id, caption=cap, reply_markup=like_skip_keyboard(candidate.user_id))
+    else:
+        await message.answer(cap, reply_markup=like_skip_keyboard(candidate.user_id))
+
+@router.callback_query(F.data.regexp(r'^(like|skip)_user_(\d+)$'))
+async def process_like_skip(callback: CallbackQuery, state: FSMContext):
+    my_id = callback.from_user.id
+    action, target_id = callback.data.split('_user_')
+    target_id = int(target_id)
+
+    # Check that target_id and my_id are valid users
+    candidate = db.get_user(target_id)
+    me = db.get_user(my_id)
+    if not candidate or not me:
+        await callback.answer("Invalid candidate.")
+        return
+
+    if action == "skip":
+        db.skip_user(my_id, target_id)
+        next_candidate = db.get_next_profile(my_id)
+        await callback.answer("Skipped.")
+        # Edit the previous message to disable buttons
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except: pass
+        if next_candidate:
+            next_cap = (
+                f"📛 Name: {next_candidate.name}\n"
+                f"🎂 Age: {next_candidate.age}\n"
+                f"⚧️ Gender: {next_candidate.gender}\n"
+                f"📝 Bio: {next_candidate.bio}\n\n"
+                "Like or skip:"
             )
+            if next_candidate.photo_id:
+                await callback.message.answer_photo(next_candidate.photo_id, caption=next_cap, reply_markup=like_skip_keyboard(next_candidate.user_id))
+            else:
+                await callback.message.answer(next_cap, reply_markup=like_skip_keyboard(next_candidate.user_id))
+            await state.update_data(last_candidate_id=next_candidate.user_id)
+        else:
+            await callback.message.answer("No more profiles available now.")
+            await state.clear()
+    elif action == "like":
+        # Check if the target user already liked back (mutual like)
+        if db.pending_like_exists(target_id, my_id):
+            # Remove pending likes for both
+            db.remove_pending_like(my_id, target_id)
+            db.set_in_chat(my_id, target_id)
+            # Notify both users
+            await callback.answer("🎉 It's a Match! Say hello!")
             try:
-                await bot.send_message(
-                    match_id,
-                    "🎉 Match found! You can now start chatting.\n\n"
-                    "💬 Send any message to chat with your partner\n"
+                await bot.send_message(target_id,
+                    "🎉 It's a Match! You both liked each other. Say hello!\n"
+                    "💬 Send any message to chat.\n"
                     "🚫 Use /stop to end the chat\n"
                     "⏭️ Use /skip to find a new partner\n"
                     "🚨 Use /report to report inappropriate behavior"
                 )
             except Exception as e:
-                logger.error(f"Notify matched user error: {e}")
+                logger.error(f"Notify match failed: {e}")
+            # Remove keyboard on old message
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except: pass
         else:
-            await message.answer("❌ Failed to create chat. Please try again.")
-    else:
-        await message.answer(
-            "😔 No matches found right now.\n"
-            "You'll remain in queue and be notified when someone else is available!"
-        )
+            db.add_pending_like(my_id, target_id)
+            await callback.answer("Liked! We'll notify you if it's a match.")
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except: pass
+            # Show next profile automatically
+            next_candidate = db.get_next_profile(my_id)
+            if next_candidate:
+                next_cap = (
+                    f"📛 Name: {next_candidate.name}\n"
+                    f"🎂 Age: {next_candidate.age}\n"
+                    f"⚧️ Gender: {next_candidate.gender}\n"
+                    f"📝 Bio: {next_candidate.bio}\n\n"
+                    "Like or skip:"
+                )
+                if next_candidate.photo_id:
+                    await callback.message.answer_photo(next_candidate.photo_id, caption=next_cap, reply_markup=like_skip_keyboard(next_candidate.user_id))
+                else:
+                    await callback.message.answer(next_cap, reply_markup=like_skip_keyboard(next_candidate.user_id))
+                await state.update_data(last_candidate_id=next_candidate.user_id)
+            else:
+                await callback.message.answer("No more profiles available now.")
+                await state.clear()
 
 @router.message(Command("stop"))
 async def cmd_stop(message: Message):
@@ -392,8 +533,7 @@ async def cmd_stop(message: Message):
         try:
             await bot.send_message(
                 partner_id,
-                "💔 Your chat partner has ended the conversation.\n\n"
-                "Use /find to search for a new match!"
+                "💔 Your chat partner has ended the conversation.\n\nUse /find to search for a new match!"
             )
         except Exception as e:
             logger.error(f"Notify partner (stop) failed: {e}")
@@ -405,14 +545,13 @@ async def cmd_skip(message: Message):
     user_id = message.from_user.id
     partner_id = db.get_current_partner(user_id)
     if partner_id:
-        db.block_user(user_id, partner_id)
+        db.skip_user(user_id, partner_id)
         db.end_chat(user_id)
         await message.answer("⏭️ Skipped current partner. Use /find to search for a new match!")
         try:
             await bot.send_message(
                 partner_id,
-                "⏭️ Your chat partner has skipped to find someone else.\n\n"
-                "Use /find to search for a new match!"
+                "⏭️ Your chat partner has skipped to find someone else.\n\nUse /find to search for a new match!"
             )
         except Exception as e:
             logger.error(f"Notify partner (skip) failed: {e}")
@@ -428,9 +567,7 @@ async def cmd_report(message: Message):
         db.block_user(user_id, partner_id)
         db.end_chat(user_id)
         await message.answer(
-            "🚨 User reported and blocked!\n"
-            "The chat has ended and you won't match with this user again.\n"
-            "Use /find to search for a new match."
+            "🚨 User reported and blocked!\nThe chat has ended and you won't match with this user again.\nUse /find to search for a new match."
         )
     else:
         await message.answer("❌ You're not currently in a chat.")
@@ -442,18 +579,12 @@ async def cmd_help(message: Message):
         "🔸 /start - Start the bot and create profile\n"
         "🔸 /profile - View your current profile\n"
         "🔸 /edit - Edit your profile\n"
-        "🔸 /find - Find a match and start chatting\n"
+        "🔸 /find - Browse profiles and match\n"
         "🔸 /stop - End current chat\n"
-        "🔸 /skip - Skip current partner\n"
+        "🔸 /skip - Skip current partner in chat or profile\n"
         "🔸 /report - Report inappropriate behavior\n"
         "🔸 /cancel - Cancel any ongoing action\n"
-        "🔸 /help - Show this help message\n\n"
-        "💡 **How to use:**\n"
-        "1. Create your profile with /start\n"
-        "2. Use /find to search for matches\n"
-        "3. Chat with your match anonymously\n"
-        "4. Use /stop or /skip when done\n"
-        "🛡️ Always report inappropriate behavior!"
+        "🔸 /help - Show this help message"
     )
     await message.answer(help_text, parse_mode="Markdown")
 
@@ -485,7 +616,7 @@ async def cmd_broadcast(message: Message):
         return
     await message.answer("📢 Please send the message you want to broadcast to all users. (Not implemented)")
 
-# ------- CALLBACK HANDLERS ----
+# InlineKeyboards for profile (edit field selection)
 @router.callback_query(F.data.startswith("gender_"))
 async def handle_gender_selection(callback: CallbackQuery, state: FSMContext):
     gender_map = {
@@ -497,9 +628,7 @@ async def handle_gender_selection(callback: CallbackQuery, state: FSMContext):
     if gender:
         await state.update_data(gender=gender)
         await callback.message.edit_text(
-            f"✅ Gender set to: {gender}\n\n"
-            "Now, please enter a short bio about yourself:"
-        )
+            f"✅ Gender set to: {gender}\n\nNow, please enter a short bio about yourself:")
         await state.set_state(ProfileStates.editing_bio)
 
 @router.callback_query(F.data.startswith("edit_"))
@@ -519,7 +648,6 @@ async def handle_edit_selection(callback: CallbackQuery, state: FSMContext):
             await callback.message.edit_text(message_text)
         await state.set_state(getattr(ProfileStates, state_name))
 
-# ------- FSM PROFILE CREATION & EDIT --------
 @router.message(ProfileStates.editing_name)
 async def process_name(message: Message, state: FSMContext):
     name = message.text.strip()
@@ -637,7 +765,6 @@ async def process_skip_photo(message: Message, state: FSMContext):
 async def process_photo_text_invalid(message: Message, state: FSMContext):
     await message.answer("❌ Please send a photo or type /skip.")
 
-# Add for photo edit as well in profile editing
 @router.message(ProfileStates.editing_photo, F.photo)
 async def update_profile_photo(message: Message, state: FSMContext):
     photo_id = message.photo[-1].file_id
@@ -657,7 +784,6 @@ async def clear_profile_photo(message: Message, state: FSMContext):
 async def invalid_edit_photo_text(message: Message, state: FSMContext):
     await message.answer("❌ Please send a photo or type /skip.")
 
-# ------- CHAT RELAY HANDLER ---------
 @router.message(F.text & ~F.text.startswith('/'))
 async def handle_chat_message(message: Message):
     user_id = message.from_user.id
@@ -696,13 +822,11 @@ async def handle_photo_chat(message: Message):
             "🔍 Use /find to search for a match!"
         )
 
-# ------- DISPATCHER ----------
 dp.include_router(router)
 
-# ---------- MAIN -------------
 async def main():
     logger.info("Starting MateFinder bot...")
     await dp.start_polling(bot)
 if __name__ == "__main__":
     asyncio.run(main())
-        
+
