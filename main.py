@@ -701,7 +701,7 @@ async def process_bio(message: Message, state: FSMContext):
     else:
         await state.update_data(bio=bio)
         await message.answer(
-            "Would you like to add a profile picture?\nSend me a photo, or type /skip."
+            "Would you like to add a profile picture?\nSend me a photo."
         )
         await state.set_state(ProfileStates.editing_photo)
 
