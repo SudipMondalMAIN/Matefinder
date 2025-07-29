@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: matefinder-web
+    env: python # Change this to your stack: node, static, docker, etc.
+    buildCommand: pip install -r requirements.txt # Change as needed
+    startCommand: python app.py # Change to your start command, e.g., gunicorn, npm start, etc.
+    plan: free # Or "starter", "standard", etc.
+    envVars:
+      - key: ENV
+        value: production
