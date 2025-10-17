@@ -1,10 +1,22 @@
+# Example render.yaml for deploying MateFinder on Render.com
+# This is optional — you can configure build/start commands in the Render dashboard instead.
 services:
   - type: web
-    name: matefinder-web
-    env: python # Change this to your stack: node, static, docker, etc.
-    buildCommand: pip install -r requirements.txt # Change as needed
-    startCommand: python app.py # Change to your start command, e.g., gunicorn, npm start, etc.
-    plan: free # Or "starter", "standard", etc.
+    name: matefinder-bot
+    env: node
+    plan: free
+    region: oregon
+    buildCommand: "npm ci"
+    startCommand: "node main.js"
     envVars:
-      - key: ENV
-        value: production
+      # Add these in the Render dashboard as environment variables/secrets instead of checking into repo
+      - key: BOT_TOKEN
+        value: "REPLACE_WITH_YOUR_BOT_TOKEN" # replace with secret in Render dashboard
+      - key: ADMIN_USER_ID
+        value: "6535216093"
+      - key: DB_NAME
+        value: "matefinder.db"
+    # Optionally mount a persistent disk for the sqlite DB (or use an external DB)
+    # disk:
+    #   name: matefinder-disk
+    #   sizeGB: 1
